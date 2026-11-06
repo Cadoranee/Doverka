@@ -5,7 +5,8 @@ ENV GOOS=linux
 
 WORKDIR /src
 
-COPY go.mod ./
+COPY go.mod go.sum ./
+COPY migrations/ ./migrations/
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 
