@@ -15,6 +15,11 @@ services:
         condition: service_healthy
       mock-provider:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   db:
     image: postgres:16.4-alpine
