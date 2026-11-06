@@ -2,7 +2,10 @@ module github.com/Cadoranee/Doverka
 
 go 1.22
 
-require github.com/jackc/pgx/v5 v5.7.4
+require (
+	github.com/jackc/pgx/v5 v5.7.4
+	github.com/shopspring/decimal v1.4.0
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
