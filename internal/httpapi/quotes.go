@@ -31,6 +31,11 @@ type Handler struct {
 	TransferView transferView
 	Ledger       balanceReserver
 	Idempotency  idempotencyRecorder
+	Runner       transferRunner
+}
+
+type transferRunner interface {
+	Run(ctx context.Context, transferID, scenario string) error
 }
 
 func (h *Handler) Routes() http.Handler {

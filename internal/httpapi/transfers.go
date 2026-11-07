@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -73,18 +74,42 @@ func (h *Handler) serveCreateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, body, err := h.createTransfer(r.Context(), idempotencyKey, rawBody, req)
+	scenario := strings.TrimSpace(r.Header.Get("X-Scenario"))
+	if !allowedTransferScenario(scenario) {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "VALIDATION_ERROR")
+		return
+	}
+
+	status, body, transferID, err := h.createTransfer(r.Context(), idempotencyKey, rawBody, req)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
 		return
 	}
 	writeRawJSON(w, status, body)
+	if transferID != "" && h.Runner != nil {
+		go func(tid, scen string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := h.Runner.Run(ctx, tid, scen); err != nil {
+				log.Printf("transfer %s run: %v", tid, err)
+			}
+		}(transferID, scenario)
+	}
 }
 
-func (h *Handler) createTransfer(ctx context.Context, idempotencyKey string, rawBody []byte, req createTransferRequest) (int, []byte, error) {
+func allowedTransferScenario(scenario string) bool {
+	switch scenario {
+	case "", "ok", "decline", "error_5xx", "slow":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) createTransfer(ctx context.Context, idempotencyKey string, rawBody []byte, req createTransferRequest) (int, []byte, string, error) {
 	tx, err := h.DB.Begin(ctx)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	defer tx.Rollback(ctx)
 
@@ -93,51 +118,55 @@ func (h *Handler) createTransfer(ctx context.Context, idempotencyKey string, raw
 		if errors.Is(err, idempotency.ErrReused) {
 			body, mErr := marshalAPIError("IDEMPOTENCY_KEY_REUSED", "IDEMPOTENCY_KEY_REUSED")
 			if mErr != nil {
-				return 0, nil, mErr
+				return 0, nil, "", mErr
 			}
-			return http.StatusConflict, body, nil
+			return http.StatusConflict, body, "", nil
 		}
 		if errors.Is(err, idempotency.ErrInProgress) {
 			body, mErr := marshalAPIError("INTERNAL", "internal error")
 			if mErr != nil {
-				return 0, nil, mErr
+				return 0, nil, "", mErr
 			}
-			return http.StatusServiceUnavailable, body, nil
+			return http.StatusServiceUnavailable, body, "", nil
 		}
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	if dec.Replay != nil {
 		if err := tx.Commit(ctx); err != nil {
-			return 0, nil, err
+			return 0, nil, "", err
 		}
-		return dec.Replay.StatusCode, dec.Replay.Body, nil
+		return dec.Replay.StatusCode, dec.Replay.Body, "", nil
 	}
 
 	q, err := h.Store.Get(ctx, req.QuoteID)
 	if err != nil {
 		if errors.Is(err, quote.ErrNotFound) {
-			return h.commitTransferError(ctx, tx, idempotencyKey, http.StatusNotFound, "QUOTE_NOT_FOUND")
+			status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusNotFound, "QUOTE_NOT_FOUND")
+			return status, body, "", cerr
 		}
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	if q.Expired(h.handlerNow()) {
-		return h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "QUOTE_EXPIRED")
+		status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "QUOTE_EXPIRED")
+		return status, body, "", cerr
 	}
 
 	bal, err := h.Ledger.LockBalance(ctx, tx, req.ClientID, q.SourceCurrency)
 	if err != nil {
 		if errors.Is(err, ledger.ErrNotFound) {
-			return h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS")
+			status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS")
+			return status, body, "", cerr
 		}
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	if bal.Available < q.SourceAmountMinor {
-		return h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS")
+		status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS")
+		return status, body, "", cerr
 	}
 
 	transferID, err := newTransferID()
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	recipient := append(json.RawMessage(nil), req.Recipient...)
 	_, err = h.Transfers.Create(ctx, tx, transfer.NewTransfer{
@@ -151,13 +180,13 @@ func (h *Handler) createTransfer(ctx context.Context, idempotencyKey string, raw
 		Recipient:         recipient,
 	})
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	if _, err := h.Transfers.Transition(ctx, tx, transferID, transfer.StatusReserved, "reserve"); err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	if err := h.Ledger.Reserve(ctx, tx, req.ClientID, q.SourceCurrency, transferID, q.SourceAmountMinor); err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 
 	successBody, err := json.Marshal(createTransferResponse{
@@ -165,15 +194,15 @@ func (h *Handler) createTransfer(ctx context.Context, idempotencyKey string, raw
 		Status:     string(transfer.StatusReserved),
 	})
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	if err := h.Idempotency.Save(ctx, tx, idempotencyKey, http.StatusAccepted, successBody); err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
-	return http.StatusAccepted, successBody, nil
+	return http.StatusAccepted, successBody, transferID, nil
 }
 
 func (h *Handler) handlerNow() time.Time {
