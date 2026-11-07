@@ -36,6 +36,13 @@ func (db *DB) Close() {
 	db.pool.Close()
 }
 
+func (db *DB) Pool() *pgxpool.Pool {
+	if db == nil {
+		return nil
+	}
+	return db.pool
+}
+
 func (db *DB) Ping(ctx context.Context) error {
 	if db == nil || db.pool == nil {
 		return errors.New("database pool is nil")
