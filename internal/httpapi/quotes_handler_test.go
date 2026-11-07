@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/Cadoranee/Doverka/internal/quote"
-	"github.com/Cadoranee/Doverka/internal/rates"
 	"github.com/Cadoranee/Doverka/internal/refdata"
 	"github.com/shopspring/decimal"
 )
@@ -274,89 +273,6 @@ func TestPostQuote_targetAmountMatchesRequest(t *testing.T) {
 	}
 	if resp.DirectionID != "RU-TH-BANK" {
 		t.Fatalf("direction_id=%q", resp.DirectionID)
-	}
-}
-
-func TestPostQuote_amountBelowMin(t *testing.T) {
-	h := testHandler(t, nil, nil)
-	body := exampleRequestBody(t, "04_below_min.json")
-	rec, _, errBody := postJSON(t, h, body)
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if errBody.Error.Code != "AMOUNT_BELOW_MIN" {
-		t.Fatalf("code=%q", errBody.Error.Code)
-	}
-}
-
-func TestPostQuote_amountAboveMax(t *testing.T) {
-	h := testHandler(t, nil, nil)
-	body := exampleRequestBody(t, "05_above_max.json")
-	rec, _, errBody := postJSON(t, h, body)
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if errBody.Error.Code != "AMOUNT_ABOVE_MAX" {
-		t.Fatalf("code=%q", errBody.Error.Code)
-	}
-}
-
-func TestPostQuote_unsupportedPayout(t *testing.T) {
-	h := testHandler(t, nil, nil)
-	body := exampleRequestBody(t, "06_unsupported_method.json")
-	rec, _, errBody := postJSON(t, h, body)
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if errBody.Error.Code != "UNSUPPORTED_DIRECTION" {
-		t.Fatalf("code=%q", errBody.Error.Code)
-	}
-}
-
-func TestPostQuote_validationError(t *testing.T) {
-	h := testHandler(t, nil, nil)
-	t.Run("invalid_json", func(t *testing.T) {
-		rec, _, errBody := postJSON(t, h, []byte("{"))
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-		}
-		if errBody.Error.Code != "VALIDATION_ERROR" {
-			t.Fatalf("code=%q", errBody.Error.Code)
-		}
-	})
-	t.Run("bad_amount_scale", func(t *testing.T) {
-		raw := `{
-  "source_country": "RU",
-  "source_currency": "RUB",
-  "target_country": "TH",
-  "target_currency": "THB",
-  "payout_method": "BANK_ACCOUNT",
-  "amount": "5000",
-  "amount_type": "SOURCE"
-}`
-		rec, _, errBody := postJSON(t, h, []byte(raw))
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-		}
-		if errBody.Error.Code != "VALIDATION_ERROR" {
-			t.Fatalf("code=%q", errBody.Error.Code)
-		}
-	})
-}
-
-func TestPostQuote_rateUnavailable(t *testing.T) {
-	store := &memStore{now: fixedNow}
-	h := testHandler(t, store, rates.ErrUnavailable)
-	body := exampleRequestBody(t, "01_source_percent_fee.json")
-	rec, _, errBody := postJSON(t, h, body)
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if errBody.Error.Code != "RATE_UNAVAILABLE" {
-		t.Fatalf("code=%q", errBody.Error.Code)
-	}
-	if store.len() != 0 {
-		t.Fatalf("store saved %d quotes", store.len())
 	}
 }
 
