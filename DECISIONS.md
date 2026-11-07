@@ -68,6 +68,8 @@ stateDiagram-v2
 
 **Terminal:** COMPLETED, FAILED, NEEDS_REVIEW.
 
+Смена статуса и проводка reserve/debit/release идут в одной транзакции. Порядок замков — в §5.
+
 ## 5. Ledger
 
 Типы проводок: `seed`, `reserve`, `release`, `debit`.
@@ -78,7 +80,12 @@ stateDiagram-v2
 
 Инвариант: сумма seed = available + reserved + debited_completed.
 
-Блокировка: `SELECT … FOR UPDATE` на строке balance клиента в транзакции POST /transfers.
+Блокировка в одной транзакции, всегда в этом порядке:
+
+1. `SELECT … FOR UPDATE` строки `client_balances` по `(client_id, source_currency)`.
+2. `SELECT … FOR UPDATE` строки `transfers` по `transfer_id`.
+
+Так берут замки и POST /transfers (reserve, затем `Create` и CREATED→RESERVED), и завершение (debit или release вместе со сменой статуса). `Transition` блокирует перевод вторым шагом. Повторный `FOR UPDATE` той же строки в той же транзакции не ждёт. Разные валюты одного клиента не блокируют друг друга.
 
 ## 6. Выбор провайдера
 
@@ -161,7 +168,8 @@ internal/store/      — postgres repos
 
 ### Где ИИ ошибся (заполнить при implement)
 
-- **TARGET-режим (ASSUMPTIONS 1.5, T1-04 → T1-08).** На этапе ASSUMPTIONS ИИ сформулировал правило «минимальный `source_amount` (шаг 1 minor), дающий `target ≥ запрошенного`» и сослался на example 03 как подтверждение, не проверив, что минимальный source там другой. Для T=124068.63 THB минимальный source — 299899.99 RUB (fee 4498.49985 → 4498.50, target 124068.6258 → 124068.63), а example ожидает 299900.00. T1-04 реализовал и зафиксировал тестом именно минимальный вариант, поэтому расхождение не было видно до T1-08, где тест обработчика сверил ответ POST /quotes с example 03 (`source_amount` и `amount_to_convert` на 0.01). Исправлено amend-ом: аналитический обратный расчёт + forward-проверка (DECISIONS §2, ASSUMPTIONS 1.5). Урок: каждое `[VERIFY]`-допущение с ссылкой на example проверять численно до написания кода.
+- **TARGET-режим (ASSUMPTIONS 1.5, T1-04 → T1-08).** На этапе ASSUMPTIONS ИИ сформулировал правило «минимальный `source_amount` (шаг 1 minor), дающий `target ≥ запрошенного`» и сослался на example 03 как подтверждение, не проверив, что минимальный source там другой. Для T=124068.63 THB минимальный source — 299899.99 RUB (fee 4498.49985 → 4498.50, target 124068.6258 → 124068.63), а example ожидает 299900.00. T1-04 реализовал и зафиксировал тестом именно минимальный вариант, поэтому расхождение не было видно до T1-08, где тест обработчика сверил ответ POST /quotes с example 03 (`source_amount` и `amount_to_convert` на 0.01). Исправлено amend-ом: аналитический обратный расчёт + forward-проверка (DECISIONS §2, ASSUMPTIONS 1.5).
+- **Порядок замков (T2-04).** В §5 была только блокировка строки `client_balances` на POST /transfers. T2-04 добавил второй замок — `SELECT … FOR UPDATE` строки `transfers` внутри `Transition` — и не зафиксировал порядок, когда одна транзакция берёт оба. POST берёт сначала баланс (reserve), затем перевод (`Create` и CREATED→RESERVED). Завершение легко собирается наоборот: сначала `Transition`, потом debit/release. Тогда одна транзакция держит перевод и ждёт баланс, другая держит баланс и ждёт тот же перевод — Postgres снимает одну из них с `deadlock detected`. Деньги не портятся, но запрос надо повторять. Исправлено в §4–§5: в одной транзакции всегда сначала строка баланса `(client_id, source_currency)`, затем строка перевода. 
 
 ## Gate 2
 
