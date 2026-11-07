@@ -262,6 +262,37 @@ ORDER BY id ASC`,
 	return out, nil
 }
 
+func (m *Machine) Attempts(ctx context.Context, transferID string) ([]ProviderAttempt, error) {
+	if err := requireMachine(m); err != nil {
+		return nil, err
+	}
+	rows, err := m.pool.Query(ctx, `
+SELECT provider_id, COALESCE(payout_id, ''), COALESCE(result, ''), attempted_at
+FROM provider_attempts
+WHERE transfer_id = $1
+ORDER BY id ASC`,
+		transferID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("select provider attempts: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ProviderAttempt{}
+	for rows.Next() {
+		var a ProviderAttempt
+		if err := rows.Scan(&a.ProviderID, &a.PayoutID, &a.Result, &a.At); err != nil {
+			return nil, fmt.Errorf("scan provider attempt: %w", err)
+		}
+		a.At = a.At.UTC()
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate provider attempts: %w", err)
+	}
+	return out, nil
+}
+
 func requireMachine(m *Machine) error {
 	if m == nil || m.pool == nil || m.clk == nil {
 		return errors.New("transfer machine is not configured")

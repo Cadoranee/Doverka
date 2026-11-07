@@ -324,29 +324,7 @@ func (e *Executor) failExhausted(ctx context.Context, tr Transfer) error {
 }
 
 func (e *Executor) loadAttempts(ctx context.Context, transferID string) ([]ProviderAttempt, error) {
-	rows, err := e.pool.Query(ctx, `
-SELECT provider_id, COALESCE(payout_id, ''), COALESCE(result, ''), attempted_at
-FROM provider_attempts
-WHERE transfer_id = $1
-ORDER BY id ASC`, transferID)
-	if err != nil {
-		return nil, fmt.Errorf("select provider attempts: %w", err)
-	}
-	defer rows.Close()
-
-	out := []ProviderAttempt{}
-	for rows.Next() {
-		var a ProviderAttempt
-		if err := rows.Scan(&a.ProviderID, &a.PayoutID, &a.Result, &a.At); err != nil {
-			return nil, fmt.Errorf("scan provider attempt: %w", err)
-		}
-		a.At = a.At.UTC()
-		out = append(out, a)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate provider attempts: %w", err)
-	}
-	return out, nil
+	return e.transfers.Attempts(ctx, transferID)
 }
 
 func (e *Executor) runInTx(ctx context.Context, fn func(pgx.Tx) error) error {
