@@ -24,7 +24,7 @@ func TestInverse_ex03_RU_TH_BANK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inverse: %v", err)
 	}
-	assertForwardOK(t, got, rate, src, feeCur, src, tgt, "299899.99", "4498.50", "295401.49", "124068.63")
+	assertForwardOK(t, got, rate, src, feeCur, src, tgt, "299900.00", "4498.50", "295401.50", "124068.63")
 
 	f98, err := Forward(decimal.RequireFromString("299899.98"), rate, tf.Fee, src, tgt)
 	if err != nil {

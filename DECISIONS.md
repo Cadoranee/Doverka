@@ -21,7 +21,9 @@
 
 **TARGET inverse**
 
-- Бинарный/линейный поиск минимального source (шаг 1 minor) так, чтобы forward(source) давал `target_amount ≥ requested` и лимиты source выполнены.
+- Аналитическая оценка source по формуле комиссии (с веткой min fee и charged_in TARGET), ROUND_HALF_UP к minor source.
+- Forward-проверка с коррекцией шагом 1 minor: вверх, пока `target < requested`; вниз — только пока `target > requested`. Точное совпадение target останавливает коррекцию, минимальный source не ищем (example 03 → 299900.00, а не 299899.99).
+- Лимиты source проверяются по итоговому source.
 
 **Курсы:** GET mock `/rates`; свежесть ≤6h; direct, inverse, one-hop cross — как ASSUMPTIONS.
 
@@ -159,7 +161,7 @@ internal/store/      — postgres repos
 
 ### Где ИИ ошибся (заполнить при implement)
 
-- TBD
+- **TARGET-режим (ASSUMPTIONS 1.5, T1-04 → T1-08).** На этапе ASSUMPTIONS ИИ сформулировал правило «минимальный `source_amount` (шаг 1 minor), дающий `target ≥ запрошенного`» и сослался на example 03 как подтверждение, не проверив, что минимальный source там другой. Для T=124068.63 THB минимальный source — 299899.99 RUB (fee 4498.49985 → 4498.50, target 124068.6258 → 124068.63), а example ожидает 299900.00. T1-04 реализовал и зафиксировал тестом именно минимальный вариант, поэтому расхождение не было видно до T1-08, где тест обработчика сверил ответ POST /quotes с example 03 (`source_amount` и `amount_to_convert` на 0.01). Исправлено amend-ом: аналитический обратный расчёт + forward-проверка (DECISIONS §2, ASSUMPTIONS 1.5). Урок: каждое `[VERIFY]`-допущение с ссылкой на example проверять численно до написания кода.
 
 ## Gate 2
 

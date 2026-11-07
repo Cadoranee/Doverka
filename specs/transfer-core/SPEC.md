@@ -138,11 +138,6 @@ Baseline: ASSUMPTIONS.md v1
 
 **L3-R-012 [SHOULD]** Transfers stuck indeterminate → NEEDS_REVIEW with reserved held until human/reconcile policy.
 
----
-
-## Open Questions
-
-См. ASSUMPTIONS.md §9 — ответы организаторов могут породить `/sdd:amend`.
 
 ## AC → Component Map (preview)
 

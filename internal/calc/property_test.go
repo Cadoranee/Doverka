@@ -43,8 +43,10 @@ func TestInverse_roundTrip_withinOneSourceStep(t *testing.T) {
 			if !q.TargetAmount.Amount.Equal(f.TargetAmount.Amount) || q.TargetAmount.Currency != f.TargetAmount.Currency {
 				t.Errorf("TargetAmount: got %s %s want %s %s", q.TargetAmount.Amount, q.TargetAmount.Currency, f.TargetAmount.Amount, f.TargetAmount.Currency)
 			}
-			if q.SourceAmount.Amount.GreaterThan(f.SourceAmount.Amount) {
-				t.Errorf("SourceAmount %s > Forward source %s", q.SourceAmount.Amount, f.SourceAmount.Amount)
+			step := decimal.New(1, -int32(src.MinorUnits))
+			srcDiff := q.SourceAmount.Amount.Sub(f.SourceAmount.Amount).Abs()
+			if srcDiff.GreaterThan(step) {
+				t.Errorf("|Inverse source - Forward source| = %s > step %s", srcDiff, step)
 			}
 
 			fq, err := Forward(q.SourceAmount.Amount, rate, tf.Fee, src, tgt)
@@ -55,18 +57,6 @@ func TestInverse_roundTrip_withinOneSourceStep(t *testing.T) {
 			assertMoneyParts(t, q.Fee, feeCur, fq.Fee.Amount.StringFixed(int32(feeCur.MinorUnits)))
 			assertMoneyParts(t, q.AmountToConvert, src, fq.AmountToConvert.Amount.StringFixed(int32(src.MinorUnits)))
 			assertMoneyParts(t, q.TargetAmount, tgt, fq.TargetAmount.Amount.StringFixed(int32(tgt.MinorUnits)))
-
-			if !q.SourceAmount.Amount.IsPositive() {
-				return
-			}
-			step := decimal.New(1, -int32(src.MinorUnits))
-			prev, err := Forward(q.SourceAmount.Amount.Sub(step), rate, tf.Fee, src, tgt)
-			if err != nil {
-				t.Fatalf("Forward(source-step): %v", err)
-			}
-			if !prev.TargetAmount.Amount.LessThan(q.TargetAmount.Amount) {
-				t.Errorf("source-step target %s, quote target %s", prev.TargetAmount.Amount, q.TargetAmount.Amount)
-			}
 		})
 	}
 }
