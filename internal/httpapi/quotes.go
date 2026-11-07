@@ -25,6 +25,11 @@ type Handler struct {
 		Save(ctx context.Context, snap quote.Snapshot, ttl time.Duration) (quote.Quote, error)
 		Get(ctx context.Context, quoteID string) (quote.Quote, error)
 	}
+	Clock       clockNow
+	DB          txBeginner
+	Transfers   transferCreator
+	Ledger      balanceReserver
+	Idempotency idempotencyRecorder
 }
 
 func (h *Handler) Routes() http.Handler {
@@ -32,6 +37,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /quotes", h.serveCreateQuote)
 	mux.HandleFunc("GET /quotes/{quote_id}", h.serveGetQuote)
 	mux.HandleFunc("GET /clients/{client_id}/balance", h.serveClientBalance)
+	mux.HandleFunc("POST /transfers", h.serveCreateTransfer)
 	return mux
 }
 

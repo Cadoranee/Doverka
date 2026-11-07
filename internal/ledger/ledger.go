@@ -71,6 +71,28 @@ VALUES ($1, $2, 0, 0)`,
 	return project(ctx, tx, clientID, currency)
 }
 
+func (l *Ledger) LockBalance(ctx context.Context, tx pgx.Tx, clientID, currency string) (Balance, error) {
+	if err := requireLedger(l); err != nil {
+		return Balance{}, err
+	}
+	if err := requireTx(tx); err != nil {
+		return Balance{}, err
+	}
+	if err := validateClientCurrency(clientID, currency); err != nil {
+		return Balance{}, err
+	}
+	available, reserved, err := lockBalance(ctx, tx, clientID, currency)
+	if err != nil {
+		return Balance{}, err
+	}
+	return Balance{
+		ClientID:  clientID,
+		Currency:  currency,
+		Available: available,
+		Reserved:  reserved,
+	}, nil
+}
+
 func (l *Ledger) Reserve(ctx context.Context, tx pgx.Tx, clientID, currency, transferID string, amountMinor int64) error {
 	if err := requireLedger(l); err != nil {
 		return err
