@@ -148,6 +148,39 @@ ORDER BY id ASC`,
 	return out, nil
 }
 
+func (l *Ledger) List(ctx context.Context, clientID string) ([]Balance, error) {
+	if err := requireLedger(l); err != nil {
+		return nil, err
+	}
+	if clientID == "" {
+		return nil, errors.New("client id is empty")
+	}
+	rows, err := l.pool.Query(ctx, `
+SELECT currency, available, reserved FROM client_balances
+WHERE client_id = $1
+ORDER BY currency ASC`,
+		clientID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("select balances: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Balance{}
+	for rows.Next() {
+		var b Balance
+		if err := rows.Scan(&b.Currency, &b.Available, &b.Reserved); err != nil {
+			return nil, fmt.Errorf("scan balance: %w", err)
+		}
+		b.ClientID = clientID
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate balances: %w", err)
+	}
+	return out, nil
+}
+
 func (l *Ledger) closeHold(ctx context.Context, tx pgx.Tx, clientID, currency, transferID string, amountMinor int64, entryType string) error {
 	if err := requireLedger(l); err != nil {
 		return err

@@ -16,8 +16,9 @@ import (
 )
 
 type Handler struct {
-	Catalog *refdata.Catalog
-	Rates   interface {
+	Catalog  *refdata.Catalog
+	Balances BalanceLister
+	Rates    interface {
 		Rate(ctx context.Context, base, quote string) (decimal.Decimal, error)
 	}
 	Store interface {
@@ -30,6 +31,7 @@ func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /quotes", h.serveCreateQuote)
 	mux.HandleFunc("GET /quotes/{quote_id}", h.serveGetQuote)
+	mux.HandleFunc("GET /clients/{client_id}/balance", h.serveClientBalance)
 	return mux
 }
 

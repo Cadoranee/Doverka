@@ -722,3 +722,49 @@ func TestReserve_sameTransactionAsTransferInsert(t *testing.T) {
 	})
 	assertBalance(t, l, clientID, "RUB", 85000, 15000)
 }
+
+func TestList_returnsCurrenciesOrdered(t *testing.T) {
+	db, l := openLedgerTest(t)
+	ctx := context.Background()
+	clientID := newTestClientID(t, "list-order")
+	t.Cleanup(func() { cleanupClient(t, db, clientID) })
+
+	inTx(t, db, func(tx pgx.Tx) error {
+		if err := l.Seed(ctx, tx, clientID, "RUB", 100000); err != nil {
+			return err
+		}
+		return l.Seed(ctx, tx, clientID, "KWD", 3000)
+	})
+
+	got, err := l.List(ctx, clientID)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2", len(got))
+	}
+	if got[0].Currency != "KWD" || got[0].Available != 3000 || got[0].Reserved != 0 || got[0].ClientID != clientID {
+		t.Fatalf("KWD: %+v", got[0])
+	}
+	if got[1].Currency != "RUB" || got[1].Available != 100000 || got[1].Reserved != 0 || got[1].ClientID != clientID {
+		t.Fatalf("RUB: %+v", got[1])
+	}
+}
+
+func TestList_unknownClientIsEmpty(t *testing.T) {
+	db, l := openLedgerTest(t)
+	ctx := context.Background()
+	clientID := newTestClientID(t, "list-empty")
+	t.Cleanup(func() { cleanupClient(t, db, clientID) })
+
+	got, err := l.List(ctx, clientID)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if got == nil {
+		t.Fatal("got nil slice, want non-nil empty")
+	}
+	if len(got) != 0 {
+		t.Fatalf("len=%d, want 0", len(got))
+	}
+}
