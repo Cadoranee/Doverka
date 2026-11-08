@@ -13,7 +13,10 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-var ErrDailyLimitExceeded = errors.New("DAILY_LIMIT_EXCEEDED")
+var (
+	ErrDailyLimitExceeded = errors.New("DAILY_LIMIT_EXCEEDED")
+	ErrDailyUsageNotFound = errors.New("daily usage not found")
+)
 
 type Converter interface {
 	Convert(ctx context.Context, amount decimal.Decimal, from, to string) (decimal.Decimal, error)
@@ -131,7 +134,7 @@ FOR UPDATE`,
 	).Scan(&stored)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return errors.New("daily usage not found")
+			return ErrDailyUsageNotFound
 		}
 		return fmt.Errorf("lock daily usage: %w", err)
 	}
@@ -156,6 +159,14 @@ WHERE client_id = $1 AND usage_date = $2::date AND currency = $3`,
 		return fmt.Errorf("update daily usage: %w", err)
 	}
 	return nil
+}
+
+func (l *Ledger) ReleaseDailyIfPresent(ctx context.Context, tx pgx.Tx, clientID string, at time.Time, currency string, amountMinor int64) error {
+	err := l.ReleaseDaily(ctx, tx, clientID, at, currency, amountMinor)
+	if err != nil && errors.Is(err, ErrDailyUsageNotFound) {
+		return nil
+	}
+	return err
 }
 
 func (l *Ledger) DailyUsage(ctx context.Context, clientID string, at time.Time) ([]DailyBucket, error) {

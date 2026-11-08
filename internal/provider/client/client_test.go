@@ -370,6 +370,61 @@ func TestFindPayout_queryAndResponses(t *testing.T) {
 	}
 }
 
+func TestCreatePayout_noReplayOnBrokenKeepAliveConnection(t *testing.T) {
+	var postCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if strings.Count(r.URL.Path, "/") == 3 && strings.Contains(r.URL.Path, "/payouts/") {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+		case http.MethodPost:
+			if strings.HasSuffix(r.URL.Path, "/payouts") {
+				n := postCount.Add(1)
+				if _, err := io.ReadAll(r.Body); err != nil {
+					t.Errorf("read body: %v", err)
+				}
+				if n == 1 {
+					hj, ok := w.(http.Hijacker)
+					if !ok {
+						t.Fatal("server is not Hijacker")
+					}
+					conn, _, err := hj.Hijack()
+					if err != nil {
+						t.Fatalf("hijack: %v", err)
+					}
+					conn.Close()
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"code":"INTERNAL_ERROR","message":"x"}`))
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "http://api:8080", nil)
+	ctx := context.Background()
+	_, _, err := c.GetPayout(ctx, "prov_alpha", "warm-id")
+	if err != nil {
+		t.Fatalf("GetPayout: %v", err)
+	}
+
+	res, err := c.CreatePayout(ctx, validCreateReq())
+	if err != nil {
+		t.Fatalf("CreatePayout: %v", err)
+	}
+	if res.Outcome != OutcomeUnknown {
+		t.Fatalf("Outcome=%q want %q", res.Outcome, OutcomeUnknown)
+	}
+	if postCount.Load() != 1 {
+		t.Fatalf("POST count=%d want 1", postCount.Load())
+	}
+}
+
 func TestCreatePayout_transportErrorUnknown(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	url := srv.URL

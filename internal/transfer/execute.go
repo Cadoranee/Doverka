@@ -17,7 +17,13 @@ import (
 
 var ErrOutcomeUnknown = errors.New("provider outcome unknown")
 
-const attemptResultUnknown = "unknown"
+var errAlreadySettled = errors.New("transfer already settled")
+
+const (
+	attemptResultUnknown = "unknown"
+	payoutPollInterval   = 500 * time.Millisecond
+	visibilityMargin     = 5 * time.Second
+)
 
 type ExecuteInput struct {
 	TransferID string
@@ -34,11 +40,13 @@ type ProviderAttempt struct {
 }
 
 type Executor struct {
-	pool      *pgxpool.Pool
-	transfers *Machine
-	balances  *ledger.Ledger
-	payouts   *providerclient.Client
-	clk       clock.Clock
+	pool         *pgxpool.Pool
+	transfers    *Machine
+	balances     *ledger.Ledger
+	payouts      *providerclient.Client
+	clk          clock.Clock
+	unknownPoll  providerclient.UnknownPoll
+	pollInterval time.Duration
 }
 
 func NewExecutor(pool *pgxpool.Pool, transfers *Machine, balances *ledger.Ledger, payouts *providerclient.Client, clk clock.Clock) *Executor {
@@ -48,6 +56,12 @@ func NewExecutor(pool *pgxpool.Pool, transfers *Machine, balances *ledger.Ledger
 		balances:  balances,
 		payouts:   payouts,
 		clk:       clk,
+		unknownPoll: providerclient.UnknownPoll{
+			Window:   providerclient.VisibilityWindow + visibilityMargin,
+			Interval: providerclient.PollInterval,
+			Clock:    clk,
+		},
+		pollInterval: payoutPollInterval,
 	}
 }
 
@@ -108,33 +122,44 @@ func (e *Executor) Execute(ctx context.Context, in ExecuteInput) error {
 			Recipient:  tr.Recipient,
 			Scenario:   in.Scenario,
 		})
-		if createErr != nil {
-			return e.recordUnknown(ctx, tr, candidate.Provider.ID, attemptNum, createErr)
-		}
-		switch createRes.Outcome {
-		case providerclient.OutcomeCreated:
+		switch {
+		case createErr == nil && createRes.Outcome == providerclient.OutcomeCreated:
 			return e.handleCreated(ctx, in, tr, candidate.Provider.ID, attemptNum, createRes)
-		case providerclient.OutcomeDeclined, providerclient.OutcomeProviderError:
-			code := createRes.Code
-			if code == "" && createRes.Outcome == providerclient.OutcomeProviderError {
-				code = selection.InternalError
-			}
-			if code == "" {
-				code = createRes.Outcome
-			}
-			if err := e.insertDeclinedAttempt(ctx, tr, candidate.Provider.ID, attemptNum, code); err != nil {
+		case createErr == nil && (createRes.Outcome == providerclient.OutcomeDeclined || createRes.Outcome == providerclient.OutcomeProviderError):
+			if err := e.insertDeclinedAttempt(ctx, tr, candidate.Provider.ID, attemptNum, declineCode(createRes)); err != nil {
 				return err
 			}
 			continue
-		case providerclient.OutcomeUnknown:
-			detail := createRes.Detail
-			if detail == "" {
-				detail = providerclient.OutcomeUnknown
-			}
-			return e.recordUnknown(ctx, tr, candidate.Provider.ID, attemptNum, errors.New(detail))
-		default:
-			return e.recordUnknown(ctx, tr, candidate.Provider.ID, attemptNum, fmt.Errorf("unexpected outcome %q", createRes.Outcome))
 		}
+		retry, err := e.resolveUnknown(ctx, in, tr, candidate.Provider.ID, attemptNum, unknownCause(createRes, createErr))
+		if retry {
+			continue
+		}
+		return err
+	}
+}
+
+func declineCode(res providerclient.CreateResult) string {
+	switch {
+	case res.Code != "":
+		return res.Code
+	case res.Outcome == providerclient.OutcomeProviderError:
+		return selection.InternalError
+	default:
+		return res.Outcome
+	}
+}
+
+func unknownCause(res providerclient.CreateResult, err error) error {
+	switch {
+	case err != nil:
+		return err
+	case res.Outcome != providerclient.OutcomeUnknown:
+		return fmt.Errorf("unexpected outcome %q", res.Outcome)
+	case res.Detail != "":
+		return errors.New(res.Detail)
+	default:
+		return errors.New(providerclient.OutcomeUnknown)
 	}
 }
 
@@ -189,9 +214,36 @@ func (e *Executor) handleCreated(ctx context.Context, in ExecuteInput, tr Transf
 	}
 }
 
+func (e *Executor) resolveUnknown(ctx context.Context, in ExecuteInput, tr Transfer, providerID string, attemptNum int, cause error) (retry bool, err error) {
+	observedAt := e.clk.Now().UTC()
+	res, payout, pollErr := e.payouts.ResolveUnknown(ctx, providerID, tr.ID, observedAt, e.unknownPoll)
+	switch res {
+	case providerclient.ResolutionPresent:
+		return false, e.handleCreated(ctx, in, tr, providerID, attemptNum, providerclient.CreateResult{
+			Outcome:  providerclient.OutcomeCreated,
+			PayoutID: payout.PayoutID,
+			Status:   payout.Status,
+		})
+	case providerclient.ResolutionAbsent:
+		if err := e.insertDeclinedAttempt(ctx, tr, providerID, attemptNum, selection.PayoutAbsent); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		recordCause := cause
+		if pollErr != nil {
+			recordCause = pollErr
+		}
+		return false, e.recordUnknown(ctx, tr, providerID, attemptNum, recordCause)
+	}
+}
+
 func (e *Executor) settlePayout(ctx context.Context, tr Transfer, providerID, payoutID, idempotencyKey string) error {
-	status, failureCode, err := e.waitPayout(ctx, providerID, payoutID)
+	status, failureCode, err := e.waitPayout(ctx, tr.ID, providerID, payoutID)
 	if err != nil {
+		if errors.Is(err, errAlreadySettled) {
+			return nil
+		}
 		return err
 	}
 	switch status {
@@ -208,10 +260,21 @@ func (e *Executor) settlePayout(ctx context.Context, tr Transfer, providerID, pa
 	}
 }
 
-func (e *Executor) waitPayout(ctx context.Context, providerID, payoutID string) (status, failureCode string, err error) {
-	ticker := time.NewTicker(15 * time.Millisecond)
+func (e *Executor) waitPayout(ctx context.Context, transferID, providerID, payoutID string) (status, failureCode string, err error) {
+	interval := e.pollInterval
+	if interval <= 0 {
+		interval = payoutPollInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		tr, getTrErr := e.transfers.Get(ctx, transferID)
+		if getTrErr != nil {
+			return "", "", getTrErr
+		}
+		if tr.Status.Terminal() {
+			return "", "", errAlreadySettled
+		}
 		payout, found, getErr := e.payouts.GetPayout(ctx, providerID, payoutID)
 		if getErr != nil {
 			return "", "", getErr
@@ -235,6 +298,13 @@ func (e *Executor) settleSuccess(ctx context.Context, tr Transfer, idempotencyKe
 		if _, _, err := lockClientBalance(ctx, tx, tr.ClientID, tr.SourceCurrency); err != nil {
 			return err
 		}
+		st, err := lockTransferStatus(ctx, tx, tr.ID)
+		if err != nil {
+			return err
+		}
+		if st.Terminal() {
+			return nil
+		}
 		if err := e.balances.Debit(ctx, tx, tr.ClientID, tr.SourceCurrency, tr.ID, tr.SourceAmountMinor); err != nil {
 			return err
 		}
@@ -250,7 +320,17 @@ func (e *Executor) settleFailure(ctx context.Context, tr Transfer, idempotencyKe
 		if _, _, err := lockClientBalance(ctx, tx, tr.ClientID, tr.SourceCurrency); err != nil {
 			return err
 		}
+		st, err := lockTransferStatus(ctx, tx, tr.ID)
+		if err != nil {
+			return err
+		}
+		if st.Terminal() {
+			return nil
+		}
 		if err := e.balances.Release(ctx, tx, tr.ClientID, tr.SourceCurrency, tr.ID, tr.SourceAmountMinor); err != nil {
+			return err
+		}
+		if err := e.balances.ReleaseDailyIfPresent(ctx, tx, tr.ClientID, tr.CreatedAt, tr.SourceCurrency, tr.SourceAmountMinor); err != nil {
 			return err
 		}
 		if _, err := e.transfers.Transition(ctx, tx, tr.ID, StatusFailed, reason); err != nil {
@@ -305,11 +385,14 @@ func (e *Executor) failExhausted(ctx context.Context, tr Transfer) error {
 		if err := e.balances.Release(ctx, tx, tr.ClientID, tr.SourceCurrency, tr.ID, tr.SourceAmountMinor); err != nil {
 			return err
 		}
-		var status string
-		if err := tx.QueryRow(ctx, `SELECT status FROM transfers WHERE transfer_id = $1 FOR UPDATE`, tr.ID).Scan(&status); err != nil {
-			return fmt.Errorf("read transfer status: %w", err)
+		if err := e.balances.ReleaseDailyIfPresent(ctx, tx, tr.ClientID, tr.CreatedAt, tr.SourceCurrency, tr.SourceAmountMinor); err != nil {
+			return err
 		}
-		switch Status(status) {
+		status, err := lockTransferStatus(ctx, tx, tr.ID)
+		if err != nil {
+			return err
+		}
+		switch status {
 		case StatusReserved:
 			if _, err := e.transfers.Transition(ctx, tx, tr.ID, StatusSubmitting, "no provider"); err != nil {
 				return err
@@ -318,7 +401,7 @@ func (e *Executor) failExhausted(ctx context.Context, tr Transfer) error {
 		default:
 			return fmt.Errorf("cannot fail transfer in status %s", status)
 		}
-		_, err := e.transfers.Transition(ctx, tx, tr.ID, StatusFailed, "providers exhausted")
+		_, err = e.transfers.Transition(ctx, tx, tr.ID, StatusFailed, "providers exhausted")
 		return err
 	})
 }
@@ -355,6 +438,14 @@ func formatProviderAmount(targetMinor int64, minorUnits int) string {
 
 func attemptKey(transferID string, attempt int) string {
 	return fmt.Sprintf("%s:%d", transferID, attempt)
+}
+
+func lockTransferStatus(ctx context.Context, tx pgx.Tx, transferID string) (Status, error) {
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM transfers WHERE transfer_id = $1 FOR UPDATE`, transferID).Scan(&status); err != nil {
+		return "", fmt.Errorf("read transfer status: %w", err)
+	}
+	return Status(status), nil
 }
 
 func lockClientBalance(ctx context.Context, tx pgx.Tx, clientID, currency string) (int64, int64, error) {

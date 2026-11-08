@@ -99,6 +99,7 @@ func (c *Client) CreatePayout(ctx context.Context, req CreateRequest) (CreateRes
 	if req.Scenario != "" {
 		httpReq.Header.Set("X-Scenario", req.Scenario)
 	}
+	httpReq.GetBody = nil
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return CreateResult{Outcome: OutcomeUnknown, Detail: err.Error()}, nil

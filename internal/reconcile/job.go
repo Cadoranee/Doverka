@@ -204,7 +204,10 @@ func postHold(ctx context.Context, tx pgx.Tx, balances *ledger.Ledger, tr transf
 	case transfer.StatusCompleted:
 		return balances.Debit(ctx, tx, tr.ClientID, tr.SourceCurrency, tr.ID, tr.SourceAmountMinor)
 	case transfer.StatusFailed:
-		return balances.Release(ctx, tx, tr.ClientID, tr.SourceCurrency, tr.ID, tr.SourceAmountMinor)
+		if err := balances.Release(ctx, tx, tr.ClientID, tr.SourceCurrency, tr.ID, tr.SourceAmountMinor); err != nil {
+			return err
+		}
+		return balances.ReleaseDailyIfPresent(ctx, tx, tr.ClientID, tr.CreatedAt, tr.SourceCurrency, tr.SourceAmountMinor)
 	default:
 		return fmt.Errorf("unsupported reconcile status %s", to)
 	}

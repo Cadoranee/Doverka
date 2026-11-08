@@ -79,8 +79,14 @@ Implementer: `cheap` = кодоген дешёвой моделью; `orchestrat
 | T3-06 | Startup resume worker | L3-R-008 | internal/reconcile/resume.go | resume_test.go | T2-07 | cheap |
 | T3-07 | Background reconcile job | L3-R-009, L3-R-012 | internal/reconcile/job.go | job_test.go | T3-02 | orchestrator |
 | T3-08 | chaos_run CI script target | L3-R-011 | Makefile or README section | manual chaos | T3-01–07 | orchestrator |
+| T3-09 | Daily limit на POST /transfers и снятие при FAILED | L3-R-010 | httpapi/transfers.go, transfer/execute.go, webhook/handler.go, reconcile/job.go | transfers_test.go | T3-05, T3-08 | orchestrator |
+| T3-10 | NO_PROVIDER_AVAILABLE до создания transfer | L2-T-018 | httpapi/transfers.go, cmd/api/app.go | transfers_test.go | T2-05, T3-09 | orchestrator |
 
-**Checkpoint L3:** `MOCK_MODE=chaos MOCK_SEED=1 python scripts/chaos_run.py --transfers 300` → RESULT OK.
+**Checkpoint L3:** `MOCK_MODE=chaos MOCK_SEED=1 python scripts/chaos_run.py --transfers 300` → RESULT OK. T3-09 и T3-10 на этот прогон не влияют.
+
+**T3-09.** В транзакции POST, до проверки `available`: `ReserveDaily` на gross `source_amount` из quote. Если не хватает и лимита, и баланса — `422 DAILY_LIMIT_EXCEEDED`, строка transfer не создаётся (ASSUMPTIONS 5.4). `ReleaseDaily` в каждой транзакции, где уже есть `Release` (execute — оба места, webhook, reconcile/job): тот же клиент, валюта, сумма и UTC-день `created_at` перевода. `NEEDS_REVIEW` лимит не снимает. Повтор того же Idempotency-Key возвращает сохранённый 422.
+
+**T3-10.** До reserve и insert — тот же `selection.Rank`, что у `Runner`. Нет primary-кандидата (нет провайдера, maintenance, margin) → `422 NO_PROVIDER_AVAILABLE`, строки transfer нет (DECISIONS §3, ASSUMPTIONS 4.11). Fallback ниже margin на POST не считается доступным. Проверка на направлениях RU-AE-BANK, RU-PH-CASH, KZ-TH-BANK. В `Handler` сейчас нет списка провайдеров и `Convert`.
 
 ---
 
@@ -89,7 +95,7 @@ Implementer: `cheap` = кодоген дешёвой моделью; `orchestrat
 | ID | Описание | ACs | Файлы | Deps |
 |----|----------|-----|-------|------|
 | T4-01 | README run + test one-liner | PDF §11 | README.md | T0-02 |
-| T4-02 | LIMITS.md honest gaps | PDF | LIMITS.md | T3-08 |
+| T4-02 | LIMITS.md honest gaps | PDF | LIMITS.md | T3-08–T3-10 |
 | T4-03 | DECISIONS §14 AI usage | PDF | DECISIONS.md | implement |
 
 ---
@@ -119,13 +125,14 @@ Implementer: `cheap` = кодоген дешёвой моделью; `orchestrat
 | L2-T-013 | T2-11 | balance_invariant_test |
 | L2-T-014 | T2-06, T2-07 | execute_integration |
 | L2-T-015–016 | T2-05, T2-07 | select_test, scenarios |
+| L2-T-018 | T3-10 | transfers_test |
 | L3-R-001 | T3-03 | idempotency_parallel |
 | L3-R-002 | T3-04 | parallel_balance |
 | L3-R-003–006 | T3-01 | webhook_test |
 | L3-R-007 | T3-02, T3-07 | unknown_test, job |
 | L3-R-008 | T3-06 | resume_test |
 | L3-R-009 | T3-07 | job_test |
-| L3-R-010 | T3-05 | daily_test |
+| L3-R-010 | T3-05, T3-09 | daily_test, transfers_test |
 | L3-R-011 | T3-08 | chaos_run |
 | L3-R-012 | T3-07 | job_test |
 
@@ -140,3 +147,5 @@ Implementer: `cheap` = кодоген дешёвой моделью; `orchestrat
 - [ ] После зелёных тестов каждой задачи — push в https://github.com/Cadoranee/Doverka (только с подтверждением)
 
 **Вердикт Gate 3:** PASS (39 задач, 28 MUST AC покрыты)
+
+После Gate 3 добавлены T3-09 и T3-10: критерии L3-R-010 и L2-T-018 уже были, до `POST /transfers` они не доходили. Contracts не меняются.

@@ -514,6 +514,53 @@ func (c errContinuer) Run(context.Context, string, string) error {
 	return c.err
 }
 
+func TestWorker_Run_unconfigured(t *testing.T) {
+	err := (*Worker)(nil).Run(context.Background(), "id", "")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err.Error() != "resume worker is not configured" {
+		t.Fatalf("error %q", err.Error())
+	}
+}
+
+func TestWorker_Run_unknownOutcomeNeedsReview(t *testing.T) {
+	db, m, led, _ := openResumeTest(t)
+	ctx := context.Background()
+	clientID, nt := seedReservedFixture(t, db, m, led)
+
+	inTx(t, db, func(tx pgx.Tx) error {
+		if _, err := led.LockBalance(ctx, tx, clientID, "RUB"); err != nil {
+			return err
+		}
+		_, err := m.Transition(ctx, tx, nt.ID, transfer.StatusSubmitting, resumeProviderID)
+		return err
+	})
+
+	w := New(db.Pool(), m, led, errContinuer{err: transfer.ErrOutcomeUnknown})
+	if err := w.Run(context.Background(), nt.ID, ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := m.Get(context.Background(), nt.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != transfer.StatusNeedsReview {
+		t.Fatalf("status %s want NEEDS_REVIEW", got.Status)
+	}
+	assertResumeBalance(t, led, clientID, 350000, 150000)
+}
+
+func TestWorker_Run_nilContinuerError(t *testing.T) {
+	db, m, led, _ := openResumeTest(t)
+	_, nt := seedReservedFixture(t, db, m, led)
+
+	w := New(db.Pool(), m, led, errContinuer{err: nil})
+	if err := w.Run(context.Background(), nt.ID, ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestResume_otherErrorStaysReserved(t *testing.T) {
 	db, m, led, _ := openResumeTest(t)
 	clientID, nt := seedReservedFixture(t, db, m, led)

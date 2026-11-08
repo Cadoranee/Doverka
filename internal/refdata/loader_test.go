@@ -193,6 +193,47 @@ func TestLoad_repoData(t *testing.T) {
 	}
 }
 
+func TestCatalog_Clients_nil(t *testing.T) {
+	var cat *Catalog
+	if got := cat.Clients(); got != nil {
+		t.Fatalf("nil catalog Clients: got %v want nil", got)
+	}
+}
+
+func TestCatalog_Clients_sortedDeepCopies(t *testing.T) {
+	cat, err := Load("../../data")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	clients := cat.Clients()
+	if len(clients) == 0 {
+		t.Fatal("expected clients")
+	}
+	for i := 1; i < len(clients); i++ {
+		if clients[i].ClientID < clients[i-1].ClientID {
+			t.Fatalf("order: %s before %s", clients[i-1].ClientID, clients[i].ClientID)
+		}
+	}
+	var target Client
+	for _, cl := range clients {
+		if _, ok := cl.Balances["RUB"]; ok {
+			target = cl
+			break
+		}
+	}
+	if target.ClientID == "" {
+		t.Fatal("no client with RUB balance")
+	}
+	target.Balances["RUB"] = decimal.Zero
+	orig, ok := cat.Client(target.ClientID)
+	if !ok {
+		t.Fatal("Client lookup failed")
+	}
+	if orig.Balances["RUB"].IsZero() {
+		t.Error("catalog balance mutated through Clients copy")
+	}
+}
+
 func TestLoad_emptyDir(t *testing.T) {
 	_, err := Load("  ")
 	if err == nil {

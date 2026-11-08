@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -14,9 +15,11 @@ import (
 
 	"github.com/Cadoranee/Doverka/internal/idempotency"
 	"github.com/Cadoranee/Doverka/internal/ledger"
+	selection "github.com/Cadoranee/Doverka/internal/provider/select"
 	"github.com/Cadoranee/Doverka/internal/quote"
 	"github.com/Cadoranee/Doverka/internal/transfer"
 	"github.com/jackc/pgx/v5"
+	"github.com/shopspring/decimal"
 )
 
 type clockNow interface {
@@ -35,6 +38,8 @@ type transferCreator interface {
 type balanceReserver interface {
 	LockBalance(ctx context.Context, tx pgx.Tx, clientID, currency string) (ledger.Balance, error)
 	Reserve(ctx context.Context, tx pgx.Tx, clientID, currency, transferID string, amountMinor int64) error
+	ReserveDaily(ctx context.Context, tx pgx.Tx, charge ledger.DailyCharge, scale ledger.MinorScale, convert ledger.Converter) error
+	ReleaseDaily(ctx context.Context, tx pgx.Tx, clientID string, at time.Time, currency string, amountMinor int64) error
 }
 
 type idempotencyRecorder interface {
@@ -151,16 +156,59 @@ func (h *Handler) createTransfer(ctx context.Context, idempotencyKey string, raw
 		status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "QUOTE_EXPIRED")
 		return status, body, "", cerr
 	}
+	reject, rankErr := h.evaluateProviders(ctx, q)
+	if rankErr != nil {
+		return 0, nil, "", rankErr
+	}
+	if reject {
+		status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "NO_PROVIDER_AVAILABLE")
+		return status, body, "", cerr
+	}
+
+	now := h.handlerNow().UTC()
+	checkDaily := h.Catalog != nil
+	if checkDaily {
+		if _, ok := h.Catalog.Client(req.ClientID); !ok {
+			checkDaily = false
+		}
+	}
 
 	bal, err := h.Ledger.LockBalance(ctx, tx, req.ClientID, q.SourceCurrency)
-	if err != nil {
-		if errors.Is(err, ledger.ErrNotFound) {
-			status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS")
-			return status, body, "", cerr
-		}
+	if err != nil && !errors.Is(err, ledger.ErrNotFound) {
 		return 0, nil, "", err
 	}
-	if bal.Available < q.SourceAmountMinor {
+
+	var dailyReserved bool
+	if checkDaily {
+		cl, _ := h.Catalog.Client(req.ClientID)
+		var convert ledger.Converter
+		if h.Convert != nil {
+			convert = convertFunc(h.Convert)
+		}
+		dailyErr := h.Ledger.ReserveDaily(ctx, tx, ledger.DailyCharge{
+			ClientID:          req.ClientID,
+			At:                now,
+			SourceCurrency:    q.SourceCurrency,
+			SourceAmountMinor: q.SourceAmountMinor,
+			LimitAmount:       cl.DailyLimit.Amount,
+			LimitCurrency:     cl.DailyLimit.Currency,
+		}, h.Catalog, convert)
+		if dailyErr != nil {
+			if errors.Is(dailyErr, ledger.ErrDailyLimitExceeded) {
+				status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "DAILY_LIMIT_EXCEEDED")
+				return status, body, "", cerr
+			}
+			return 0, nil, "", dailyErr
+		}
+		dailyReserved = true
+	}
+
+	if errors.Is(err, ledger.ErrNotFound) || bal.Available < q.SourceAmountMinor {
+		if dailyReserved {
+			if relErr := h.Ledger.ReleaseDaily(ctx, tx, req.ClientID, now, q.SourceCurrency, q.SourceAmountMinor); relErr != nil {
+				return 0, nil, "", relErr
+			}
+		}
 		status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS")
 		return status, body, "", cerr
 	}
@@ -264,6 +312,85 @@ func writeRawJSON(w http.ResponseWriter, status int, body []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
+}
+
+type convertFunc func(context.Context, decimal.Decimal, string, string) (decimal.Decimal, error)
+
+func (f convertFunc) Convert(ctx context.Context, amount decimal.Decimal, from, to string) (decimal.Decimal, error) {
+	return f(ctx, amount, from, to)
+}
+
+func (h *Handler) evaluateProviders(ctx context.Context, q quote.Quote) (reject bool, err error) {
+	if h.Providers == nil {
+		return false, nil
+	}
+	if h.Catalog == nil {
+		return false, errors.New("catalog is required for provider check")
+	}
+	tariff, ok := h.Catalog.Tariff(q.DirectionID)
+	if !ok {
+		return false, fmt.Errorf("tariff for direction %q not found", q.DirectionID)
+	}
+	sourceCur, ok := h.Catalog.Currency(q.SourceCurrency)
+	if !ok {
+		return false, fmt.Errorf("unknown currency %q", q.SourceCurrency)
+	}
+	feeCur, ok := h.Catalog.Currency(q.FeeCurrency)
+	if !ok {
+		return false, fmt.Errorf("unknown currency %q", q.FeeCurrency)
+	}
+	targetCur, ok := h.Catalog.Currency(q.TargetCurrency)
+	if !ok {
+		return false, fmt.Errorf("unknown currency %q", q.TargetCurrency)
+	}
+	minorUnits := map[string]int{
+		q.SourceCurrency: sourceCur.MinorUnits,
+		q.FeeCurrency:    feeCur.MinorUnits,
+		q.TargetCurrency: targetCur.MinorUnits,
+	}
+	for _, p := range h.Providers {
+		if p.Currency == "" {
+			continue
+		}
+		if _, known := minorUnits[p.Currency]; known {
+			continue
+		}
+		cur, ok := h.Catalog.Currency(p.Currency)
+		if !ok {
+			return false, fmt.Errorf("unknown currency %q", p.Currency)
+		}
+		minorUnits[p.Currency] = cur.MinorUnits
+	}
+	selReq := selection.Request{
+		DirectionID:      q.DirectionID,
+		At:               h.handlerNow().UTC(),
+		SourceAmount:     decimal.New(q.SourceAmountMinor, -int32(sourceCur.MinorUnits)),
+		SourceCurrency:   q.SourceCurrency,
+		FeeAmount:        decimal.New(q.FeeAmountMinor, -int32(feeCur.MinorUnits)),
+		FeeCurrency:      q.FeeCurrency,
+		TargetAmount:     decimal.New(q.TargetAmountMinor, -int32(targetCur.MinorUnits)),
+		TargetCurrency:   q.TargetCurrency,
+		MinMarginPercent: tariff.MinMarginPercent,
+	}
+	var convertErr error
+	var convert selection.ConvertFunc
+	if h.Convert != nil {
+		convert = func(amount decimal.Decimal, from, to string) (decimal.Decimal, error) {
+			out, err := h.Convert(ctx, amount, from, to)
+			if err != nil {
+				convertErr = err
+			}
+			return out, err
+		}
+	}
+	ranked, err := selection.Rank(selReq, h.Providers, minorUnits, convert)
+	if err != nil {
+		return false, err
+	}
+	if convertErr != nil && len(ranked.Primary) == 0 {
+		return false, convertErr
+	}
+	return len(ranked.Primary) == 0, nil
 }
 
 func newTransferID() (string, error) {

@@ -43,10 +43,11 @@ type webhookPayload struct {
 }
 
 type payoutTransfer struct {
-	clientID string
-	currency string
-	amount   int64
-	status   transfer.Status
+	clientID  string
+	currency  string
+	amount    int64
+	status    transfer.Status
+	createdAt time.Time
 }
 
 func (h *Handler) Handler() http.Handler {
@@ -215,7 +216,10 @@ func targetStatus(eventStatus string) (transfer.Status, string) {
 
 func postLedger(ctx context.Context, tx pgx.Tx, led *ledger.Ledger, tr payoutTransfer, payload webhookPayload) error {
 	if payload.Status == eventStatusFailed {
-		return led.Release(ctx, tx, tr.clientID, tr.currency, payload.Reference, tr.amount)
+		if err := led.Release(ctx, tx, tr.clientID, tr.currency, payload.Reference, tr.amount); err != nil {
+			return err
+		}
+		return led.ReleaseDailyIfPresent(ctx, tx, tr.clientID, tr.createdAt, tr.currency, tr.amount)
 	}
 	return led.Debit(ctx, tx, tr.clientID, tr.currency, payload.Reference, tr.amount)
 }
@@ -224,10 +228,10 @@ func findTransfer(ctx context.Context, tx pgx.Tx, transferID string) (payoutTran
 	var tr payoutTransfer
 	var status string
 	err := tx.QueryRow(ctx, `
-SELECT client_id, source_amount_minor, source_currency, status
+SELECT client_id, source_amount_minor, source_currency, status, created_at
 FROM transfers WHERE transfer_id = $1`,
 		transferID,
-	).Scan(&tr.clientID, &tr.amount, &tr.currency, &status)
+	).Scan(&tr.clientID, &tr.amount, &tr.currency, &status, &tr.createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return payoutTransfer{}, false, nil
 	}

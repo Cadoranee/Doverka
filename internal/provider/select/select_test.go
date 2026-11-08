@@ -279,3 +279,22 @@ func ids(candidates []Candidate) string {
 	}
 	return out
 }
+
+func TestAllowsFailover_payoutAbsentAndNextSkipsProvider(t *testing.T) {
+	if !AllowsFailover(PayoutAbsent) {
+		t.Fatal("PAYOUT_ABSENT must allow failover")
+	}
+	ranked := Ranked{
+		Primary: []Candidate{
+			{Provider: Provider{ID: "first"}},
+			{Provider: Provider{ID: "second"}},
+		},
+	}
+	candidate, ok := ranked.Next([]Attempt{{ProviderID: "first", Code: PayoutAbsent}})
+	if !ok {
+		t.Fatal("expected next provider")
+	}
+	if candidate.Provider.ID != "second" {
+		t.Fatalf("provider %s want second", candidate.Provider.ID)
+	}
+}

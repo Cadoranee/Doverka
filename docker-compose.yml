@@ -8,6 +8,7 @@ services:
       MOCK_PROVIDER_URL: http://mock-provider:9000
       PROVIDER_WEBHOOK_SECRET: ${PROVIDER_WEBHOOK_SECRET:-local-dev-webhook-secret}
       DATA_DIR: /data
+      API_PUBLIC_URL: http://api:8080
     volumes:
       - ./data:/data:ro
     depends_on:
@@ -23,12 +24,14 @@ services:
 
   db:
     image: postgres:16.4-alpine
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_USER: transfer
       POSTGRES_PASSWORD: transfer
       POSTGRES_DB: transfer
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/dataы
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U transfer -d transfer"]
       interval: 2s

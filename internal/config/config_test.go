@@ -14,6 +14,7 @@ func clearEnv(t *testing.T) {
 		"MOCK_PROVIDER_URL",
 		"PROVIDER_WEBHOOK_SECRET",
 		"DATA_DIR",
+		"API_PUBLIC_URL",
 	} {
 		t.Setenv(k, "")
 		if err := os.Unsetenv(k); err != nil {
@@ -47,6 +48,9 @@ func TestLoad_mapsFullEnvWithDefaults(t *testing.T) {
 	if cfg.DataDir != "data" {
 		t.Errorf("DataDir: got %q, want %q", cfg.DataDir, "data")
 	}
+	if cfg.APIPublicURL != "http://localhost:8080" {
+		t.Errorf("APIPublicURL: got %q, want %q", cfg.APIPublicURL, "http://localhost:8080")
+	}
 }
 
 func TestLoad_explicitHTTPAddrAndDataDirOverrideDefaults(t *testing.T) {
@@ -56,6 +60,7 @@ func TestLoad_explicitHTTPAddrAndDataDirOverrideDefaults(t *testing.T) {
 	t.Setenv("PROVIDER_WEBHOOK_SECRET", "test-webhook-secret-value")
 	t.Setenv("HTTP_ADDR", "  127.0.0.1:9090  ")
 	t.Setenv("DATA_DIR", "  /var/lib/doverka  ")
+	t.Setenv("API_PUBLIC_URL", "  http://api:8080  ")
 
 	cfg, err := Load()
 	if err != nil {
@@ -66,6 +71,9 @@ func TestLoad_explicitHTTPAddrAndDataDirOverrideDefaults(t *testing.T) {
 	}
 	if cfg.DataDir != "/var/lib/doverka" {
 		t.Errorf("DataDir: got %q, want %q", cfg.DataDir, "/var/lib/doverka")
+	}
+	if cfg.APIPublicURL != "http://api:8080" {
+		t.Errorf("APIPublicURL: got %q, want %q", cfg.APIPublicURL, "http://api:8080")
 	}
 }
 

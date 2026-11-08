@@ -129,6 +129,8 @@ func buildScenarioServer(t *testing.T, db *store.DB, mockURL, dataDir string) *h
 		TransferView: machine,
 		Ledger:       led,
 		Idempotency:  idempotency.New(db.Pool()),
+		Convert:      rateSvc.Convert,
+		Providers:    providers,
 	}
 	srv := httptest.NewServer(h.Routes())
 	t.Cleanup(srv.Close)
@@ -154,6 +156,9 @@ func resetClientForScenario(t *testing.T, db *store.DB, led *ledger.Ledger, cat 
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM transfers WHERE client_id = $1`, clientID); err != nil {
 		t.Fatalf("delete transfers: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM daily_usage WHERE client_id = $1`, clientID); err != nil {
+		t.Fatalf("delete daily_usage: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM client_balances WHERE client_id = $1`, clientID); err != nil {
 		t.Fatalf("delete client_balances: %v", err)

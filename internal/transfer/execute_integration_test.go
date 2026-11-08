@@ -3,6 +3,7 @@ package transfer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	selection "github.com/Cadoranee/Doverka/internal/provider/select"
 	"github.com/Cadoranee/Doverka/internal/store"
 	"github.com/jackc/pgx/v5"
+	"github.com/shopspring/decimal"
 )
 
 func cleanupExecute(t *testing.T, db *store.DB, clientID, transferID, quoteID string) {
@@ -35,6 +37,9 @@ func cleanupExecute(t *testing.T, db *store.DB, clientID, transferID, quoteID st
 	}
 	if _, err := db.Pool().Exec(ctx, `DELETE FROM quotes WHERE quote_id = $1`, quoteID); err != nil {
 		t.Fatalf("cleanup quotes: %v", err)
+	}
+	if _, err := db.Pool().Exec(ctx, `DELETE FROM daily_usage WHERE client_id = $1`, clientID); err != nil {
+		t.Fatalf("cleanup daily_usage: %v", err)
 	}
 	if _, err := db.Pool().Exec(ctx, `DELETE FROM client_balances WHERE client_id = $1`, clientID); err != nil {
 		t.Fatalf("cleanup client_balances: %v", err)
@@ -95,6 +100,16 @@ func newExecuteEnv(t *testing.T, handler http.Handler) (*Executor, *Machine, *le
 	pc := providerclient.New(srv.URL, "http://api.test", nil)
 	led := ledger.New(db.Pool())
 	exec := NewExecutor(db.Pool(), m, led, pc, fake)
+	exec.unknownPoll = providerclient.UnknownPoll{
+		Window:   300 * time.Millisecond,
+		Interval: 20 * time.Millisecond,
+		Clock:    fake,
+		Wait: func(ctx context.Context, d time.Duration) error {
+			fake.Advance(d)
+			return nil
+		},
+	}
+	exec.pollInterval = 10 * time.Millisecond
 	return exec, m, led, db
 }
 
@@ -179,6 +194,67 @@ func TestExecute_okScenarioCompletesAndDebits(t *testing.T) {
 	}
 	if attempts[0].ProviderID != providerID || attempts[0].Result != "COMPLETED" || attempts[0].PayoutID != "po_ok" {
 		t.Fatalf("attempt: %+v", attempts[0])
+	}
+}
+
+type integrationMinorScale map[string]int
+
+func (s integrationMinorScale) MinorUnits(currency string) (int, bool) {
+	u, ok := s[currency]
+	return u, ok
+}
+
+func TestExecute_failedReleasesDailyUsage(t *testing.T) {
+	const providerID = "prov_decline_daily"
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"code":"RECIPIENT_ACCOUNT_INVALID","message":"bad"}`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	exec, m, led, db := newExecuteEnv(t, h)
+	clientID, nt := reservedTransferFixture(t, db, m, led)
+	t.Cleanup(func() { cleanupExecute(t, db, clientID, nt.ID, nt.QuoteID) })
+
+	got, err := m.Get(context.Background(), nt.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	scale := integrationMinorScale{"RUB": 2, "THB": 2}
+	ctx := context.Background()
+	inTx(t, db, func(tx pgx.Tx) error {
+		return led.ReserveDaily(ctx, tx, ledger.DailyCharge{
+			ClientID:          clientID,
+			At:                got.CreatedAt,
+			SourceCurrency:    nt.SourceCurrency,
+			SourceAmountMinor: nt.SourceAmountMinor,
+			LimitAmount:       decimal.RequireFromString("1000000.00"),
+			LimitCurrency:     "RUB",
+		}, scale, nil)
+	})
+
+	err = exec.Execute(context.Background(), ExecuteInput{
+		TransferID: nt.ID,
+		Scenario:   "decline",
+		MinorUnits: 2,
+		Ranked:     selection.Ranked{Primary: []selection.Candidate{{Provider: selection.Provider{ID: providerID}}}},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got, _ = m.Get(context.Background(), nt.ID)
+	if got.Status != StatusFailed {
+		t.Fatalf("status %s want FAILED", got.Status)
+	}
+	buckets, err := led.DailyUsage(ctx, clientID, got.CreatedAt)
+	if err != nil {
+		t.Fatalf("DailyUsage: %v", err)
+	}
+	if len(buckets) != 0 {
+		t.Fatalf("daily usage not released: %+v", buckets)
 	}
 }
 
@@ -403,6 +479,267 @@ func TestExecute_slowScenarioDoesNotBlockCaller(t *testing.T) {
 		t.Fatal("Execute did not finish")
 	}
 	got, _ = m.Get(ctx, nt.ID)
+	if got.Status != StatusCompleted {
+		t.Fatalf("status %s want COMPLETED", got.Status)
+	}
+	assertBalance(t, led, clientID, 350000, 0)
+}
+
+func TestExecute_unknownOutcomeReferenceFindsPayoutCompletes(t *testing.T) {
+	const providerID = "prov_unknown_hit"
+	const p2 = "prov_unused"
+	var postRef string
+	var postProviders []string
+	var mu sync.Mutex
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		prov := parts[0]
+		if r.Method == http.MethodPost {
+			mu.Lock()
+			postProviders = append(postProviders, prov)
+			mu.Unlock()
+			var body struct {
+				Reference string `json:"reference"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postRef = body.Reference
+			if prov == providerID {
+				w.WriteHeader(http.StatusGatewayTimeout)
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodGet && prov == providerID && r.URL.Query().Get("reference") != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"payout_id":"po_found","reference":"` + postRef + `","status":"COMPLETED"}`))
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "po_found") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"payout_id":"po_found","reference":"` + postRef + `","status":"COMPLETED"}`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	exec, m, led, db := newExecuteEnv(t, h)
+	clientID, nt := reservedTransferFixture(t, db, m, led)
+	t.Cleanup(func() { cleanupExecute(t, db, clientID, nt.ID, nt.QuoteID) })
+
+	err := exec.Execute(context.Background(), ExecuteInput{
+		TransferID: nt.ID,
+		MinorUnits: 2,
+		Ranked: selection.Ranked{
+			Primary: []selection.Candidate{
+				{Provider: selection.Provider{ID: providerID}},
+				{Provider: selection.Provider{ID: p2}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got, _ := m.Get(context.Background(), nt.ID)
+	if got.Status != StatusCompleted {
+		t.Fatalf("status %s want COMPLETED", got.Status)
+	}
+	assertBalance(t, led, clientID, 350000, 0)
+	attempts, _ := exec.Attempts(context.Background(), nt.ID)
+	if len(attempts) != 1 || attempts[0].PayoutID != "po_found" || attempts[0].Result != "COMPLETED" {
+		t.Fatalf("attempts: %+v", attempts)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(postProviders) != 1 || postProviders[0] != providerID {
+		t.Fatalf("post providers %v want only %s", postProviders, providerID)
+	}
+}
+
+func TestExecute_unknownAbsentFailsOverToNextProvider(t *testing.T) {
+	const p1, p2 = "prov_gone", "prov_ok"
+	var postRef string
+	var postOrder []string
+	var mu sync.Mutex
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		prov := parts[0]
+		if r.Method == http.MethodPost {
+			mu.Lock()
+			postOrder = append(postOrder, prov)
+			mu.Unlock()
+			var body struct {
+				Reference string `json:"reference"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postRef = body.Reference
+			if prov == p1 {
+				w.WriteHeader(http.StatusGatewayTimeout)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"payout_id":"po_ok","status":"PROCESSING"}`))
+			return
+		}
+		if r.Method == http.MethodGet && prov == p1 && r.URL.Query().Get("reference") != "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodGet && prov == p2 && strings.HasSuffix(r.URL.Path, "po_ok") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"payout_id":"po_ok","reference":"` + postRef + `","status":"COMPLETED"}`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	exec, m, led, db := newExecuteEnv(t, h)
+	clientID, nt := reservedTransferFixture(t, db, m, led)
+	t.Cleanup(func() { cleanupExecute(t, db, clientID, nt.ID, nt.QuoteID) })
+
+	err := exec.Execute(context.Background(), ExecuteInput{
+		TransferID: nt.ID,
+		MinorUnits: 2,
+		Ranked: selection.Ranked{
+			Primary: []selection.Candidate{
+				{Provider: selection.Provider{ID: p1}},
+				{Provider: selection.Provider{ID: p2}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got, _ := m.Get(context.Background(), nt.ID)
+	if got.Status != StatusCompleted {
+		t.Fatalf("status %s want COMPLETED", got.Status)
+	}
+	attempts, _ := exec.Attempts(context.Background(), nt.ID)
+	if len(attempts) != 2 || attempts[0].Result != selection.PayoutAbsent || attempts[1].Result != "COMPLETED" {
+		t.Fatalf("attempts: %+v", attempts)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(postOrder) != 2 || postOrder[0] != p1 || postOrder[1] != p2 {
+		t.Fatalf("post order %v", postOrder)
+	}
+}
+
+func TestExecute_unknownReferencePoll500StaysSubmitting(t *testing.T) {
+	const providerID = "prov_poll_err"
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		prov := parts[0]
+		if r.Method == http.MethodPost && prov == providerID {
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
+		}
+		if r.Method == http.MethodGet && prov == providerID && r.URL.Query().Get("reference") != "" {
+			http.Error(w, "provider down", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	exec, m, led, db := newExecuteEnv(t, h)
+	clientID, nt := reservedTransferFixture(t, db, m, led)
+	t.Cleanup(func() { cleanupExecute(t, db, clientID, nt.ID, nt.QuoteID) })
+
+	err := exec.Execute(context.Background(), ExecuteInput{
+		TransferID: nt.ID,
+		MinorUnits: 2,
+		Ranked:     selection.Ranked{Primary: []selection.Candidate{{Provider: selection.Provider{ID: providerID}}}},
+	})
+	if err == nil || !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("Execute err %v want ErrOutcomeUnknown", err)
+	}
+	got, _ := m.Get(context.Background(), nt.ID)
+	if got.Status != StatusSubmitting {
+		t.Fatalf("status %s want SUBMITTING", got.Status)
+	}
+	attempts, _ := exec.Attempts(context.Background(), nt.ID)
+	if len(attempts) != 1 || attempts[0].Result != attemptResultUnknown {
+		t.Fatalf("attempts: %+v", attempts)
+	}
+	assertBalance(t, led, clientID, 350000, 150000)
+}
+
+func TestExecute_settleNoopsWhenTransferAlreadyTerminal(t *testing.T) {
+	const providerID = "prov_webhook_race"
+	processingStarted := make(chan struct{}, 1)
+	var postRef string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var body struct {
+				Reference string `json:"reference"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postRef = body.Reference
+			select {
+			case processingStarted <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"payout_id":"po_race","status":"PROCESSING"}`))
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "po_race") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"payout_id":"po_race","reference":"` + postRef + `","status":"PROCESSING"}`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	exec, m, led, db := newExecuteEnv(t, h)
+	clientID, nt := reservedTransferFixture(t, db, m, led)
+	t.Cleanup(func() { cleanupExecute(t, db, clientID, nt.ID, nt.QuoteID) })
+
+	ctx := context.Background()
+	done := make(chan error, 1)
+	go func() {
+		done <- exec.Execute(ctx, ExecuteInput{
+			TransferID: nt.ID,
+			MinorUnits: 2,
+			Ranked:     selection.Ranked{Primary: []selection.Candidate{{Provider: selection.Provider{ID: providerID}}}},
+		})
+	}()
+	select {
+	case <-processingStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for payout create")
+	}
+	for {
+		got, err := m.Get(ctx, nt.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Status == StatusProcessing {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	inTx(t, db, func(tx pgx.Tx) error {
+		if _, _, err := lockClientBalance(ctx, tx, clientID, "RUB"); err != nil {
+			return err
+		}
+		if err := led.Debit(ctx, tx, clientID, "RUB", nt.ID, nt.SourceAmountMinor); err != nil {
+			return err
+		}
+		_, err := m.Transition(ctx, tx, nt.ID, StatusCompleted, "webhook")
+		return err
+	})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Execute did not finish")
+	}
+	got, _ := m.Get(ctx, nt.ID)
 	if got.Status != StatusCompleted {
 		t.Fatalf("status %s want COMPLETED", got.Status)
 	}

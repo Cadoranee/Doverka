@@ -12,6 +12,7 @@ type Config struct {
 	MockProviderURL       string
 	ProviderWebhookSecret string
 	DataDir               string
+	APIPublicURL          string
 }
 
 func Load() (Config, error) {
@@ -36,6 +37,7 @@ func Load() (Config, error) {
 		MockProviderURL:       mock,
 		ProviderWebhookSecret: secret,
 		DataDir:               envOrDefault("DATA_DIR", "data"),
+		APIPublicURL:          envOrDefault("API_PUBLIC_URL", "http://localhost:8080"),
 	}, nil
 }
 

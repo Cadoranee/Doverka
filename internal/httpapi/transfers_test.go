@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,11 +18,15 @@ import (
 	"github.com/Cadoranee/Doverka/internal/clock"
 	"github.com/Cadoranee/Doverka/internal/idempotency"
 	"github.com/Cadoranee/Doverka/internal/ledger"
+	selection "github.com/Cadoranee/Doverka/internal/provider/select"
 	"github.com/Cadoranee/Doverka/internal/quote"
+	"github.com/Cadoranee/Doverka/internal/rates"
+	"github.com/Cadoranee/Doverka/internal/refdata"
 	"github.com/Cadoranee/Doverka/internal/store"
 	"github.com/Cadoranee/Doverka/internal/transfer"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/shopspring/decimal"
 )
 
 type transferExecer interface {
@@ -180,7 +185,309 @@ DELETE FROM transfer_transitions WHERE transfer_id IN (SELECT transfer_id FROM t
 	if idempotencyKey != "" {
 		_, _ = db.Pool().Exec(ctx, `DELETE FROM idempotency_keys WHERE idempotency_key = $1`, idempotencyKey)
 	}
+	_, _ = db.Pool().Exec(ctx, `DELETE FROM daily_usage WHERE client_id = $1`, clientID)
 	_, _ = db.Pool().Exec(ctx, `DELETE FROM client_balances WHERE client_id = $1`, clientID)
+}
+
+func writeDailyLimitCatalog(t *testing.T, clientID, limitAmount string) *refdata.Catalog {
+	t.Helper()
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "currencies.json"), `[
+  {"code":"RUB","minor_units":2},
+  {"code":"THB","minor_units":2}
+]`)
+	mustWrite(t, filepath.Join(dir, "tariffs.json"), `[
+  {
+    "direction_id": "RU-TH-BANK",
+    "source": {"country": "RU", "currency": "RUB"},
+    "target": {"country": "TH", "currency": "THB"},
+    "payout_method": "BANK_ACCOUNT",
+    "fee": {"percent": "1.50", "fixed": "0.00", "min": "50.00", "charged_in": "SOURCE"},
+    "amount_limits": {"min": "1000.00", "max": "300000.00", "currency": "RUB"},
+    "min_margin_percent": "0.50",
+    "quote_ttl_sec": 900
+  }
+]`)
+	mustWrite(t, filepath.Join(dir, "clients.json"), fmt.Sprintf(`[
+  {
+    "client_id": %q,
+    "balances": {"RUB": "10000000.00"},
+    "daily_limit": {"amount": %q, "currency": "RUB"}
+  }
+]`, clientID, limitAmount))
+	cat, err := refdata.Load(dir)
+	if err != nil {
+		t.Fatalf("Load catalog: %v", err)
+	}
+	return cat
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func dailyBuckets(t *testing.T, led *ledger.Ledger, clientID string, at time.Time) []ledger.DailyBucket {
+	t.Helper()
+	b, err := led.DailyUsage(context.Background(), clientID, at)
+	if err != nil {
+		t.Fatalf("DailyUsage: %v", err)
+	}
+	return b
+}
+
+func insertDirectionQuote(t *testing.T, exec transferExecer, quoteID, direction string, sourceAmount int64, expiresAt time.Time) {
+	t.Helper()
+	var row struct {
+		srcC, srcCo, tgtC, tgtCo, payout string
+		feeMinor                         int64
+		convertMinor, targetMinor        int64
+		rate                             string
+	}
+	switch direction {
+	case "RU-AE-BANK":
+		row = struct {
+			srcC, srcCo, tgtC, tgtCo, payout string
+			feeMinor                         int64
+			convertMinor, targetMinor        int64
+			rate                             string
+		}{"RUB", "RU", "AED", "AE", "BANK_ACCOUNT", 2100, 147900, 5920, "0.0400"}
+	case "RU-PH-CASH":
+		row = struct {
+			srcC, srcCo, tgtC, tgtCo, payout string
+			feeMinor                         int64
+			convertMinor, targetMinor        int64
+			rate                             string
+		}{"RUB", "RU", "PHP", "PH", "CASH_PICKUP", 3750, 146250, 89000, "0.6080"}
+	case "KZ-TH-BANK":
+		row = struct {
+			srcC, srcCo, tgtC, tgtCo, payout string
+			feeMinor                         int64
+			convertMinor, targetMinor        int64
+			rate                             string
+		}{"KZT", "KZ", "THB", "TH", "BANK_ACCOUNT", 1250, 148750, 54945, "0.0085"}
+	default:
+		row = struct {
+			srcC, srcCo, tgtC, tgtCo, payout string
+			feeMinor                         int64
+			convertMinor, targetMinor        int64
+			rate                             string
+		}{"RUB", "RU", "THB", "TH", "BANK_ACCOUNT", 1500, 148500, 54945, "0.3700"}
+	}
+	ctx := context.Background()
+	_, err := exec.Exec(ctx, `
+INSERT INTO quotes (
+	quote_id, direction_id, source_country, source_currency, target_country, target_currency,
+	payout_method, amount_type, source_amount_minor, fee_amount_minor, fee_currency,
+	amount_to_convert_minor, rate, target_amount_minor, breakdown, expires_at, created_at
+) VALUES (
+	$1, $2, $3, $4, $5, $6, $7, 'SOURCE',
+	$8, $9, $4, $10, $11::numeric, $12, '[]'::jsonb, $13, $13
+)`,
+		quoteID, direction, row.srcCo, row.srcC, row.tgtCo, row.tgtC, row.payout,
+		sourceAmount, row.feeMinor, row.convertMinor, row.rate, row.targetMinor, expiresAt,
+	)
+	if err != nil {
+		t.Fatalf("insert quote %s: %v", direction, err)
+	}
+}
+
+func loadRepoCatalogAndProviders(t *testing.T) (*refdata.Catalog, []selection.Provider) {
+	t.Helper()
+	dataDir := filepath.Join("..", "..", "data")
+	cat, err := refdata.Load(dataDir)
+	if err != nil {
+		t.Fatalf("refdata.Load: %v", err)
+	}
+	providers, err := selection.LoadProviders(filepath.Join(dataDir, "providers.json"))
+	if err != nil {
+		t.Fatalf("LoadProviders: %v", err)
+	}
+	return cat, providers
+}
+
+func TestPostTransfer_dailyLimitExceeded(t *testing.T) {
+	db, h, led := openTransferHTTPTest(t)
+	clientID := "limit-" + randHexID(t, 8)
+	quoteID := "quote-limit-" + randHexID(t, 8)
+	idemKey := "idem-limit-" + randHexID(t, 8)
+	h.Catalog = writeDailyLimitCatalog(t, clientID, "100.00")
+	t.Cleanup(func() { cleanupTransferClient(t, db, clientID, quoteID, idemKey) })
+	insertTransferTestQuote(t, db.Pool(), quoteID, 150000, transferFixedNow.Add(time.Hour))
+	seedBalance(t, db, led, clientID, 10_000_000)
+	body := transferBody(quoteID, clientID, "")
+	rec, _, errBody := postTransfer(t, h.Routes(), idemKey, body)
+	assertAPIError(t, rec, errBody, http.StatusUnprocessableEntity, "DAILY_LIMIT_EXCEEDED")
+	if countTransfersByQuote(t, db, quoteID) != 0 {
+		t.Fatalf("expected no transfer")
+	}
+	bal, _ := led.Balance(context.Background(), clientID, "RUB")
+	if bal.Available != 10_000_000 || bal.Reserved != 0 {
+		t.Fatalf("balance changed: %+v", bal)
+	}
+	if len(dailyBuckets(t, led, clientID, transferFixedNow)) != 0 {
+		t.Fatalf("daily bucket should be empty")
+	}
+	rec2, _, errBody2 := postTransfer(t, h.Routes(), idemKey, body)
+	assertAPIError(t, rec2, errBody2, http.StatusUnprocessableEntity, "DAILY_LIMIT_EXCEEDED")
+	if countTransfersByQuote(t, db, quoteID) != 0 {
+		t.Fatalf("replay created transfer")
+	}
+}
+
+func TestPostTransfer_dailyLimitBeforeInsufficientFunds(t *testing.T) {
+	db, h, led := openTransferHTTPTest(t)
+	clientID := "both-" + randHexID(t, 8)
+	quoteID := "quote-both-" + randHexID(t, 8)
+	idemKey := "idem-both-" + randHexID(t, 8)
+	h.Catalog = writeDailyLimitCatalog(t, clientID, "10.00")
+	t.Cleanup(func() { cleanupTransferClient(t, db, clientID, quoteID, idemKey) })
+	insertTransferTestQuote(t, db.Pool(), quoteID, 150000, transferFixedNow.Add(time.Hour))
+	seedBalance(t, db, led, clientID, 100)
+	rec, _, errBody := postTransfer(t, h.Routes(), idemKey, transferBody(quoteID, clientID, ""))
+	assertAPIError(t, rec, errBody, http.StatusUnprocessableEntity, "DAILY_LIMIT_EXCEEDED")
+	if len(dailyBuckets(t, led, clientID, transferFixedNow)) != 0 {
+		t.Fatalf("daily bucket should be empty after reject")
+	}
+}
+
+func TestPostTransfer_dailyLimitInsufficientFundsRelease(t *testing.T) {
+	db, h, led := openTransferHTTPTest(t)
+	clientID := "insuf-" + randHexID(t, 8)
+	quoteID := "quote-insuf-" + randHexID(t, 8)
+	idemKey := "idem-insuf-" + randHexID(t, 8)
+	h.Catalog = writeDailyLimitCatalog(t, clientID, "1000000.00")
+	t.Cleanup(func() { cleanupTransferClient(t, db, clientID, quoteID, idemKey) })
+	insertTransferTestQuote(t, db.Pool(), quoteID, 150000, transferFixedNow.Add(time.Hour))
+	seedBalance(t, db, led, clientID, 100)
+	rec, _, errBody := postTransfer(t, h.Routes(), idemKey, transferBody(quoteID, clientID, ""))
+	assertAPIError(t, rec, errBody, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS")
+	if len(dailyBuckets(t, led, clientID, transferFixedNow)) != 0 {
+		t.Fatalf("daily usage should be released")
+	}
+}
+
+func TestPostTransfer_dailyLimitSuccessRecordsUsage(t *testing.T) {
+	db, h, led := openTransferHTTPTest(t)
+	clientID := "oklim-" + randHexID(t, 8)
+	quoteID := "quote-oklim-" + randHexID(t, 8)
+	idemKey := "idem-oklim-" + randHexID(t, 8)
+	h.Catalog = writeDailyLimitCatalog(t, clientID, "10000.00")
+	t.Cleanup(func() { cleanupTransferClient(t, db, clientID, quoteID, idemKey) })
+	insertTransferTestQuote(t, db.Pool(), quoteID, 150000, transferFixedNow.Add(time.Hour))
+	seedBalance(t, db, led, clientID, 150000)
+	rec, created, _ := postTransfer(t, h.Routes(), idemKey, transferBody(quoteID, clientID, `"bank":"SCB"`))
+	if rec.Code != http.StatusAccepted || created.TransferID == "" {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	buckets := dailyBuckets(t, led, clientID, transferFixedNow)
+	if len(buckets) != 1 || buckets[0].AmountMinor != 150000 || buckets[0].Currency != "RUB" {
+		t.Fatalf("daily usage: %+v", buckets)
+	}
+}
+
+func TestPostTransfer_noProviderDirections(t *testing.T) {
+	db, h, led := openTransferHTTPTest(t)
+	cat, providers := loadRepoCatalogAndProviders(t)
+	h.Catalog = cat
+	h.Providers = providers
+	h.Convert = func(ctx context.Context, amount decimal.Decimal, from, to string) (decimal.Decimal, error) {
+		return amount, nil
+	}
+	clientID := "noprov-" + randHexID(t, 8)
+	idemKey := "idem-noprov-" + randHexID(t, 8)
+	t.Cleanup(func() { cleanupTransferClient(t, db, clientID, "", idemKey) })
+	seedBalance(t, db, led, clientID, 10_000_000)
+	directions := []string{"RU-AE-BANK", "RU-PH-CASH", "KZ-TH-BANK"}
+	for _, dir := range directions {
+		quoteID := "quote-" + dir + "-" + randHexID(t, 6)
+		t.Cleanup(func(q, c string) func() {
+			return func() { cleanupTransferClient(t, db, c, q, "") }
+		}(quoteID, clientID))
+		insertDirectionQuote(t, db.Pool(), quoteID, dir, 150000, transferFixedNow.Add(time.Hour))
+		rec, _, errBody := postTransfer(t, h.Routes(), idemKey+"-"+dir, transferBody(quoteID, clientID, `"bank":"x"`))
+		assertAPIError(t, rec, errBody, http.StatusUnprocessableEntity, "NO_PROVIDER_AVAILABLE")
+		if countTransfersByQuote(t, db, quoteID) != 0 {
+			t.Fatalf("%s: transfer row created", dir)
+		}
+	}
+	quoteID := "quote-replay-noprov-" + randHexID(t, 8)
+	insertDirectionQuote(t, db.Pool(), quoteID, "RU-AE-BANK", 150000, transferFixedNow.Add(time.Hour))
+	idem := "idem-noprov-replay"
+	body := transferBody(quoteID, clientID, `"bank":"x"`)
+	rec, _, errBody := postTransfer(t, h.Routes(), idem, body)
+	assertAPIError(t, rec, errBody, http.StatusUnprocessableEntity, "NO_PROVIDER_AVAILABLE")
+	rec2, _, errBody2 := postTransfer(t, h.Routes(), idem, body)
+	assertAPIError(t, rec2, errBody2, http.StatusUnprocessableEntity, "NO_PROVIDER_AVAILABLE")
+	t.Cleanup(func() { cleanupTransferClient(t, db, clientID, quoteID, idem) })
+}
+
+func TestPostTransfer_hasProviderRUThBank(t *testing.T) {
+	mockURL := strings.TrimSpace(os.Getenv("MOCK_PROVIDER_URL"))
+	if mockURL == "" {
+		t.Skip("MOCK_PROVIDER_URL is not set")
+	}
+	db, h, led := openTransferHTTPTest(t)
+	cat, providers := loadRepoCatalogAndProviders(t)
+	clk := clock.NewFake(transferFixedNow)
+	rateSvc := rates.New(rates.NewHTTPSource(mockURL, nil), clk)
+	h.Catalog = cat
+	h.Providers = providers
+	h.Convert = rateSvc.Convert
+	clientID := "hasprov-" + randHexID(t, 8)
+	quoteID := "quote-ruth-" + randHexID(t, 8)
+	idemKey := "idem-hasprov-" + randHexID(t, 8)
+	t.Cleanup(func() { cleanupTransferClient(t, db, clientID, quoteID, idemKey) })
+	insertDirectionQuote(t, db.Pool(), quoteID, "RU-TH-BANK", 150000, transferFixedNow.Add(time.Hour))
+	seedBalance(t, db, led, clientID, 150000)
+	rec, created, errBody := postTransfer(t, h.Routes(), idemKey, transferBody(quoteID, clientID, `"bank":"SCB"`))
+	if rec.Code != http.StatusAccepted || created.TransferID == "" {
+		t.Fatalf("status=%d err=%+v", rec.Code, errBody)
+	}
+}
+
+func TestPostTransfer_rateFailureIsNotStoredAsNoProvider(t *testing.T) {
+	db, h, led := openTransferHTTPTest(t)
+	cat, _ := loadRepoCatalogAndProviders(t)
+	h.Catalog = cat
+	h.Providers = []selection.Provider{{
+		ID:           "prov_rate",
+		Directions:   []string{"RU-TH-BANK"},
+		Currency:     "USD",
+		Enabled:      true,
+		P95LatencyMs: 1000,
+		SuccessRate:  decimal.NewFromInt(1),
+		Fee:          selection.Fee{Percent: decimal.Zero, Fixed: decimal.Zero},
+		Limits:       selection.Limits{Min: decimal.Zero, Max: decimal.NewFromInt(1_000_000)},
+	}}
+	ratesDown := true
+	h.Convert = func(_ context.Context, amount decimal.Decimal, _, _ string) (decimal.Decimal, error) {
+		if ratesDown {
+			return decimal.Decimal{}, fmt.Errorf("rates down")
+		}
+		return amount, nil
+	}
+	clientID := "rate-" + randHexID(t, 8)
+	quoteID := "quote-rate-" + randHexID(t, 8)
+	idemKey := "idem-rate-" + randHexID(t, 8)
+	t.Cleanup(func() { cleanupTransferClient(t, db, clientID, quoteID, idemKey) })
+	insertTransferTestQuote(t, db.Pool(), quoteID, 150000, transferFixedNow.Add(time.Hour))
+	seedBalance(t, db, led, clientID, 150000)
+	body := transferBody(quoteID, clientID, `"bank":"SCB"`)
+	rec, _, errBody := postTransfer(t, h.Routes(), idemKey, body)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d err=%+v", rec.Code, errBody)
+	}
+	if countTransfersByQuote(t, db, quoteID) != 0 {
+		t.Fatal("transfer row created")
+	}
+	ratesDown = false
+	rec, created, errBody := postTransfer(t, h.Routes(), idemKey, body)
+	if rec.Code != http.StatusAccepted || created.TransferID == "" {
+		t.Fatalf("retry status=%d err=%+v", rec.Code, errBody)
+	}
 }
 
 func TestPostTransfer_missingIdempotencyKey(t *testing.T) {

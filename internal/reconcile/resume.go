@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Cadoranee/Doverka/internal/ledger"
 	"github.com/Cadoranee/Doverka/internal/transfer"
@@ -31,8 +32,8 @@ func New(pool *pgxpool.Pool, transfers *transfer.Machine, balances *ledger.Ledge
 }
 
 func (w *Worker) Resume(ctx context.Context) error {
-	if w == nil || w.pool == nil || w.transfers == nil || w.balances == nil || w.run == nil {
-		return errors.New("resume worker is not configured")
+	if err := w.configured(); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -84,11 +85,29 @@ ORDER BY created_at, transfer_id`,
 	return ids, nil
 }
 
-func (w *Worker) resumeOne(ctx context.Context, id string) error {
-	err := w.run.Run(ctx, id, "")
-	if errors.Is(err, transfer.ErrOutcomeUnknown) {
-		return w.markNeedsReview(ctx, id)
+func (w *Worker) configured() error {
+	if w == nil || w.pool == nil || w.transfers == nil || w.balances == nil || w.run == nil {
+		return errors.New("resume worker is not configured")
 	}
+	return nil
+}
+
+func (w *Worker) Run(ctx context.Context, transferID, scenario string) error {
+	if err := w.configured(); err != nil {
+		return err
+	}
+	err := w.run.Run(ctx, transferID, scenario)
+	if errors.Is(err, transfer.ErrOutcomeUnknown) {
+		bg := context.WithoutCancel(ctx)
+		bg, cancel := context.WithTimeout(bg, 10*time.Second)
+		defer cancel()
+		return w.markNeedsReview(bg, transferID)
+	}
+	return err
+}
+
+func (w *Worker) resumeOne(ctx context.Context, id string) error {
+	err := w.Run(ctx, id, "")
 	if err != nil {
 		return err
 	}

@@ -17,6 +17,7 @@ const (
 	InternalError           = "INTERNAL_ERROR"
 	ProviderDisabled        = "PROVIDER_DISABLED"
 	ProviderMaintenance     = "PROVIDER_MAINTENANCE"
+	PayoutAbsent            = "PAYOUT_ABSENT"
 )
 
 var (
@@ -92,7 +93,7 @@ type priced struct {
 
 func AllowsFailover(code string) bool {
 	switch code {
-	case RecipientAccountInvalid, CurrencyNotSupported, AmountOutOfLimits, InternalError, ProviderDisabled, ProviderMaintenance:
+	case RecipientAccountInvalid, CurrencyNotSupported, AmountOutOfLimits, InternalError, ProviderDisabled, ProviderMaintenance, PayoutAbsent:
 		return true
 	default:
 		return false

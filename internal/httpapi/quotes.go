@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Cadoranee/Doverka/internal/calc"
+	selection "github.com/Cadoranee/Doverka/internal/provider/select"
 	"github.com/Cadoranee/Doverka/internal/quote"
 	"github.com/Cadoranee/Doverka/internal/rates"
 	"github.com/Cadoranee/Doverka/internal/refdata"
@@ -32,6 +33,8 @@ type Handler struct {
 	Ledger       balanceReserver
 	Idempotency  idempotencyRecorder
 	Runner       transferRunner
+	Convert      func(ctx context.Context, amount decimal.Decimal, from, to string) (decimal.Decimal, error)
+	Providers    []selection.Provider
 }
 
 type transferRunner interface {

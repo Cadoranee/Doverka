@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/shopspring/decimal"
@@ -335,6 +336,14 @@ func (c *Catalog) Currency(code string) (Currency, bool) {
 	return v, ok
 }
 
+func (c *Catalog) MinorUnits(currency string) (int, bool) {
+	cur, ok := c.Currency(currency)
+	if !ok {
+		return 0, false
+	}
+	return cur.MinorUnits, true
+}
+
 func (c *Catalog) Tariff(directionID string) (Tariff, bool) {
 	if c == nil {
 		return Tariff{}, false
@@ -384,6 +393,24 @@ func copyTariff(t Tariff) Tariff {
 		MinMarginPercent: t.MinMarginPercent.Copy(),
 		QuoteTTLSec:      t.QuoteTTLSec,
 	}
+}
+
+func (c *Catalog) Clients() []Client {
+	if c == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(c.clients))
+	for id := range c.clients {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]Client, 0, len(ids))
+	for _, id := range ids {
+		if cl, ok := c.Client(id); ok {
+			out = append(out, cl)
+		}
+	}
+	return out
 }
 
 func (c *Catalog) Client(id string) (Client, bool) {
