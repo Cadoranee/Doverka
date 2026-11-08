@@ -107,6 +107,11 @@ func allowedTransferScenario(scenario string) bool {
 }
 
 func (h *Handler) createTransfer(ctx context.Context, idempotencyKey string, rawBody []byte, req createTransferRequest) (int, []byte, string, error) {
+	q, qErr := h.Store.Get(ctx, req.QuoteID)
+	if qErr != nil && !errors.Is(qErr, quote.ErrNotFound) {
+		return 0, nil, "", qErr
+	}
+
 	tx, err := h.DB.Begin(ctx)
 	if err != nil {
 		return 0, nil, "", err
@@ -138,13 +143,9 @@ func (h *Handler) createTransfer(ctx context.Context, idempotencyKey string, raw
 		return dec.Replay.StatusCode, dec.Replay.Body, "", nil
 	}
 
-	q, err := h.Store.Get(ctx, req.QuoteID)
-	if err != nil {
-		if errors.Is(err, quote.ErrNotFound) {
-			status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusNotFound, "QUOTE_NOT_FOUND")
-			return status, body, "", cerr
-		}
-		return 0, nil, "", err
+	if qErr != nil {
+		status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusNotFound, "QUOTE_NOT_FOUND")
+		return status, body, "", cerr
 	}
 	if q.Expired(h.handlerNow()) {
 		status, body, cerr := h.commitTransferError(ctx, tx, idempotencyKey, http.StatusUnprocessableEntity, "QUOTE_EXPIRED")
